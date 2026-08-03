@@ -1,5 +1,5 @@
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-python-dotenv==1.0.1
-pydantic[email]==2.10.3
-stripe==11.3.0
+fastapi>=0.115.0,<0.116
+uvicorn[standard]>=0.32.0,<0.33
+python-dotenv>=1.0.0
+pydantic[email]>=2.9.0,<2.11
+stripe>=11.0.0,<12
