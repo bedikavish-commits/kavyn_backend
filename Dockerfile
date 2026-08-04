@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY stripe_prices.json* ./
+COPY leads.jsonl* ./
 
 ENV PORT=10000
 EXPOSE 10000

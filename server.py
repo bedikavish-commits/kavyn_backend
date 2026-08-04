@@ -10,6 +10,7 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,6 +28,7 @@ SHIPPING_FLAT_CAD = 12.0
 TAX_RATE = 0.13
 AUTO_CREATE = os.environ.get("STRIPE_AUTO_CREATE", "").strip().lower() in ("1", "true", "yes")
 PRICES_FILE = Path(__file__).parent / "stripe_prices.json"
+LEADS_FILE = Path(__file__).parent / "leads.jsonl"
 
 PRODUCTS: List[Dict[str, Any]] = [
     {"id": "ambery-bergamot", "name": "Ambery Bergamot", "variants": [
@@ -98,6 +100,8 @@ PRODUCTS: List[Dict[str, Any]] = [
 BY_ID = {p["id"]: p for p in PRODUCTS}
 _PRICE_MAP: Dict[Tuple[str, str], str] = {}
 _PRICE_MAP_LOADED = False
+_IMAGE_MAP: Dict[str, str] = {}
+_IMAGE_MAP_LOADED = False
 _TX_MEMORY: Dict[str, Dict] = {}
 _NEWSLETTER: set = set()
 
@@ -273,6 +277,52 @@ def get_price_id(product_id: str, size_slug: str) -> str:
     return pid
 
 
+def ensure_image_map() -> None:
+    """Populate _IMAGE_MAP {product_id: image_url} from each product's matched Stripe Price.
+
+    Best-effort: if Stripe isn't configured or a lookup fails, that product is
+    simply left without an image (frontend already falls back to a stock photo).
+    """
+    global _IMAGE_MAP_LOADED
+    if _IMAGE_MAP_LOADED or not stripe.api_key:
+        return
+    try:
+        ensure_price_map()
+    except HTTPException:
+        return
+
+    for prod in PRODUCTS:
+        variant = next((v for v in prod["variants"] if "50" in v["size"]), prod["variants"][-1])
+        price_id = _PRICE_MAP.get((prod["id"], variant["size_slug"]))
+        if not price_id:
+            continue
+        try:
+            price = stripe.Price.retrieve(price_id, expand=["product"])
+            images = list(getattr(price.product, "images", None) or [])
+            if images:
+                _IMAGE_MAP[prod["id"]] = images[0]
+        except Exception:
+            continue
+
+    _IMAGE_MAP_LOADED = True
+
+
+def _append_lead(record: Dict[str, Any]) -> None:
+    """Append one marketing lead (email + cart snapshot) to a local JSONL file.
+
+    Best-effort — never raises, so a storage hiccup can't break checkout.
+    NOTE: on hosts without a persistent disk/volume this file is wiped on every
+    redeploy. For durable marketing data, point this at a database or an ESP
+    (Klaviyo/Mailchimp) API instead.
+    """
+    try:
+        record = {"captured_at": datetime.now(timezone.utc).isoformat(), **record}
+        with LEADS_FILE.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
 class CartItem(BaseModel):
     product_id: str
     quantity: int = Field(ge=1, le=20)
@@ -281,15 +331,19 @@ class CartItem(BaseModel):
 
 
 class CustomerInfo(BaseModel):
+    # Only email is collected on-site now. Shipping address & phone are
+    # collected by Stripe's hosted Checkout page instead (see
+    # shipping_address_collection / phone_number_collection below), so these
+    # are optional here rather than required.
     email: EmailStr
-    first_name: str
-    last_name: str
+    first_name: Optional[str] = ""
+    last_name: Optional[str] = ""
     phone: Optional[str] = ""
-    address_1: str
+    address_1: Optional[str] = ""
     address_2: Optional[str] = ""
-    city: str
-    state: str = "ON"
-    postcode: str
+    city: Optional[str] = ""
+    state: Optional[str] = ""
+    postcode: Optional[str] = ""
     order_notes: Optional[str] = ""
 
 
@@ -372,6 +426,8 @@ def health():
 
 @api.post("/stripe/sync")
 def stripe_sync():
+    global _IMAGE_MAP_LOADED
+    _IMAGE_MAP_LOADED = False  # force images to be re-fetched alongside prices
     return refresh_price_map()
 
 
@@ -383,11 +439,13 @@ def stripe_mapping():
 
 @api.get("/products")
 def list_products():
+    ensure_image_map()
     out = []
     for p in PRODUCTS:
         preferred = next((v for v in p["variants"] if "50" in v["size"]), p["variants"][-1])
         out.append({
             "id": p["id"], "name": p["name"], "price": preferred["price"],
+            "image": _IMAGE_MAP.get(p["id"], ""),
             "variants": [{"size": v["size"], "size_slug": v["size_slug"], "price": v["price"]} for v in p["variants"]],
         })
     return out
@@ -481,6 +539,13 @@ def create_checkout_session(payload: CheckoutSessionCreateRequest):
         "payment_status": "initiated",
     }
     _TX_MEMORY[session.id] = tx
+    _append_lead({
+        "type": "checkout_started",
+        "email": cust.get("email"),
+        "session_id": session.id,
+        "cart": order["line_items"],
+        "total": order["total"],
+    })
     return {"url": session.url, "session_id": session.id}
 
 
@@ -510,8 +575,32 @@ def checkout_status(session_id: str):
 
 @api.post("/newsletter/subscribe")
 def newsletter_subscribe(body: NewsletterRequest):
-    _NEWSLETTER.add(body.email.lower().strip())
+    email = body.email.lower().strip()
+    _NEWSLETTER.add(email)
+    _append_lead({"type": "newsletter_signup", "email": email})
     return {"ok": True, "message": "Thank you — you are on the list."}
+
+
+@api.get("/leads")
+def list_leads():
+    """Export captured emails + cart snapshots for marketing use.
+
+    NOTE: unauthenticated, like the rest of this minimal backend. If this
+    is exposed on the public internet, put it behind an admin key or pull
+    it manually instead of linking to it from anywhere on-site.
+    """
+    if not LEADS_FILE.exists():
+        return []
+    leads = []
+    for line in LEADS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            leads.append(json.loads(line))
+        except Exception:
+            continue
+    return leads
 
 
 app.include_router(api)
