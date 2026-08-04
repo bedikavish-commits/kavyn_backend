@@ -100,8 +100,8 @@ PRODUCTS: List[Dict[str, Any]] = [
 BY_ID = {p["id"]: p for p in PRODUCTS}
 _PRICE_MAP: Dict[Tuple[str, str], str] = {}
 _PRICE_MAP_LOADED = False
-_IMAGE_MAP: Dict[str, str] = {}
-_IMAGE_MAP_LOADED = False
+_STRIPE_META: Dict[str, Dict[str, Any]] = {}
+_STRIPE_META_LOADED = False
 _TX_MEMORY: Dict[str, Dict] = {}
 _NEWSLETTER: set = set()
 
@@ -171,11 +171,13 @@ def _list_stripe_prices() -> List[Dict[str, Any]]:
         for p in page.data:
             prod = p.product
             name = getattr(prod, "name", None) or str(prod)
+            images = list(getattr(prod, "images", None) or [])
             results.append({
                 "price_id": p.id,
                 "unit_amount": p.unit_amount,
                 "currency": (p.currency or "").lower(),
                 "product_name": name or "",
+                "images": images,
             })
         if not page.has_more:
             break
@@ -277,34 +279,48 @@ def get_price_id(product_id: str, size_slug: str) -> str:
     return pid
 
 
-def ensure_image_map() -> None:
-    """Populate _IMAGE_MAP {product_id: image_url} from each product's matched Stripe Price.
+def ensure_stripe_meta() -> None:
+    """Populate _STRIPE_META {price_id: {unit_amount, image}} from ONE Stripe Price
+    listing call (reusing the same paginated fetch used for ID matching), instead of
+    doing a separate stripe.Price.retrieve() round-trip per product like before.
 
-    Best-effort: if Stripe isn't configured or a lookup fails, that product is
-    simply left without an image (frontend already falls back to a stock photo).
+    That old approach made up to 32 sequential Stripe API calls on every cold start
+    (slow — this is why the catalogue was taking so long to load). This does it in
+    one paginated listing instead.
+
+    This is also what keeps displayed prices in sync with Stripe: unit_amount here
+    is read live from Stripe every time this cache is (re)built, rather than from
+    the hardcoded `price` field on PRODUCTS below — so if you change a price in the
+    Stripe Dashboard, the site picks it up next sync instead of staying stale.
     """
-    global _IMAGE_MAP_LOADED
-    if _IMAGE_MAP_LOADED or not stripe.api_key:
+    global _STRIPE_META_LOADED
+    if _STRIPE_META_LOADED or not stripe.api_key:
         return
     try:
-        ensure_price_map()
-    except HTTPException:
-        return
+        for sp in _list_stripe_prices():
+            _STRIPE_META[sp["price_id"]] = {
+                "unit_amount": sp["unit_amount"],
+                "image": (sp["images"][0] if sp["images"] else ""),
+            }
+        _STRIPE_META_LOADED = True
+    except Exception:
+        pass  # leave unloaded so the next request retries
 
-    for prod in PRODUCTS:
-        variant = next((v for v in prod["variants"] if "50" in v["size"]), prod["variants"][-1])
-        price_id = _PRICE_MAP.get((prod["id"], variant["size_slug"]))
-        if not price_id:
-            continue
-        try:
-            price = stripe.Price.retrieve(price_id, expand=["product"])
-            images = list(getattr(price.product, "images", None) or [])
-            if images:
-                _IMAGE_MAP[prod["id"]] = images[0]
-        except Exception:
-            continue
 
-    _IMAGE_MAP_LOADED = True
+def live_variant(product_id: str, size_slug: str, fallback_price: float) -> Dict[str, Any]:
+    """Resolve {price, image} for one product variant, preferring live Stripe data
+    (current Price.unit_amount + Product.images) and falling back to the hardcoded
+    PRODUCTS price / no image if Stripe isn't configured or that price isn't mapped."""
+    ensure_price_map()
+    ensure_stripe_meta()
+    price_id = _PRICE_MAP.get((product_id, size_slug))
+    meta = _STRIPE_META.get(price_id) if price_id else None
+    if meta and meta.get("unit_amount") is not None:
+        price = round(meta["unit_amount"] / 100, 2)
+    else:
+        price = fallback_price
+    image = (meta or {}).get("image") or ""
+    return {"price": price, "image": image}
 
 
 def _append_lead(record: Dict[str, Any]) -> None:
@@ -377,10 +393,13 @@ def _compute_order(items: List[CartItem]) -> Dict:
         if not prod:
             raise HTTPException(status_code=400, detail=f"Unknown product: {item.product_id}")
         variant = _resolve_variant(prod, item.size_slug)
-        unit = float(variant["price"])
+        price_id = get_price_id(prod["id"], variant["size_slug"])
+        # Read the price live from Stripe (falls back to the hardcoded value only if
+        # Stripe is unreachable) so the total we show here always matches what the
+        # Stripe Checkout line item for `price_id` will actually charge.
+        unit = live_variant(prod["id"], variant["size_slug"], float(variant["price"]))["price"]
         line_total = round(unit * item.quantity, 2)
         subtotal += line_total
-        price_id = get_price_id(prod["id"], variant["size_slug"])
         line_items.append({
             "product_id": prod["id"], "name": prod["name"], "size": variant.get("size"),
             "unit_price": unit, "quantity": item.quantity, "line_total": line_total,
@@ -426,8 +445,8 @@ def health():
 
 @api.post("/stripe/sync")
 def stripe_sync():
-    global _IMAGE_MAP_LOADED
-    _IMAGE_MAP_LOADED = False  # force images to be re-fetched alongside prices
+    global _STRIPE_META_LOADED
+    _STRIPE_META_LOADED = False  # force prices + images to be re-fetched from Stripe
     return refresh_price_map()
 
 
@@ -439,14 +458,18 @@ def stripe_mapping():
 
 @api.get("/products")
 def list_products():
-    ensure_image_map()
     out = []
     for p in PRODUCTS:
-        preferred = next((v for v in p["variants"] if "50" in v["size"]), p["variants"][-1])
+        variants_out = []
+        for v in p["variants"]:
+            live = live_variant(p["id"], v["size_slug"], v["price"])
+            variants_out.append({"size": v["size"], "size_slug": v["size_slug"], "price": live["price"]})
+        preferred = next((v for v in variants_out if "50" in v["size"]), variants_out[-1])
+        preferred_image = live_variant(p["id"], preferred["size_slug"], preferred["price"])["image"]
         out.append({
             "id": p["id"], "name": p["name"], "price": preferred["price"],
-            "image": _IMAGE_MAP.get(p["id"], ""),
-            "variants": [{"size": v["size"], "size_slug": v["size_slug"], "price": v["price"]} for v in p["variants"]],
+            "image": preferred_image,
+            "variants": variants_out,
         })
     return out
 
@@ -460,7 +483,7 @@ def checkout_quote(items: List[CartItem]):
         if not prod:
             continue
         variant = _resolve_variant(prod, item.size_slug)
-        unit = float(variant["price"])
+        unit = live_variant(prod["id"], variant["size_slug"], float(variant["price"]))["price"]
         line_total = round(unit * item.quantity, 2)
         subtotal += line_total
         line_items.append({
