@@ -143,14 +143,24 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Frontend seed IDs that differ from WC-derived names
+_ID_ALIASES = {
+    "kavyn-signature-formula": "kavyn-signature-blend",
+    "kavyn-signature-blend": "kavyn-signature-blend",
+}
+
+
 def _stable_id_from_wc(name: str, slug: str) -> str:
     name_part = (name or "").split("|")[0].strip()
     n = _norm(name_part)
     for fb in PRODUCTS_FALLBACK:
         if _norm(fb["name"]) == n or fb["id"] in (slug or ""):
-            return fb["id"]
-    # derive from name
-    return re.sub(r"[^a-z0-9]+", "-", n).strip("-") or (slug or "product")
+            return _ID_ALIASES.get(fb["id"], fb["id"])
+    # special-case house blend naming
+    if "signature" in n and ("blend" in n or "formula" in n):
+        return "kavyn-signature-blend"
+    derived = re.sub(r"[^a-z0-9]+", "-", n).strip("-") or (slug or "product")
+    return _ID_ALIASES.get(derived, derived)
 
 
 def _size_slug_from_label(label: str) -> str:
@@ -175,7 +185,7 @@ def _wc_request(method: str, path: str, body: Optional[dict] = None, timeout: in
     qs = urlencode({"consumer_key": WC_KEY, "consumer_secret": WC_SECRET})
     url = f"{WC_STORE_URL}{path}{'&' if '?' in path else '?'}{qs}"
     data = None
-    headers = {"User-Agent": "kavyn-api/3.0", "Accept": "application/json"}
+    headers = {"User-Agent": "kavyn-api/3.1.0", "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -192,31 +202,64 @@ def _wc_request(method: str, path: str, body: Optional[dict] = None, timeout: in
 
 
 def _fetch_wc_catalogue() -> List[Dict[str, Any]]:
+    """Load products + variations from WooCommerce (parallel variation fetches)."""
     global _WC_VARIANT_MAP
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     parents = _wc_request("GET", "/wp-json/wc/v3/products?per_page=100&status=publish")
     if not isinstance(parents, list):
         return []
+
+    def _load_variations(wc_product_id: int) -> list:
+        try:
+            return _wc_request(
+                "GET",
+                f"/wp-json/wc/v3/products/{wc_product_id}/variations?per_page=50",
+            ) or []
+        except Exception:
+            return []
+
+    variable_ids = [wp["id"] for wp in parents if wp.get("type") == "variable"]
+    vars_by_parent: Dict[int, list] = {}
+    if variable_ids:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = {pool.submit(_load_variations, pid): pid for pid in variable_ids}
+            for fut in as_completed(futs):
+                vars_by_parent[futs[fut]] = fut.result()
 
     out: List[Dict[str, Any]] = []
     variant_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for wp in parents:
         name_raw = (wp.get("name") or "").split("|")[0].strip()
+        # inspired by from name after | or from short description
+        inspired = ""
+        if "|" in (wp.get("name") or ""):
+            tail = (wp.get("name") or "").split("|", 1)[1].strip()
+            m = re.search(r"Inspired by\s+(.+)", tail, re.I)
+            inspired = (m.group(1).strip() if m else tail)
         product_id = _stable_id_from_wc(name_raw, wp.get("slug") or "")
+        is_signature = product_id == "kavyn-signature-blend" or "signature" in _norm(name_raw)
+        if is_signature:
+            inspired = ""
+            product_id = "kavyn-signature-blend"
+
         images = wp.get("images") or []
         image = images[0]["src"] if images else ""
         wc_product_id = wp.get("id")
+        featured = bool(wp.get("featured"))
+
+        # strip HTML for descriptions
+        def _strip(html: str) -> str:
+            t = re.sub(r"<[^>]+>", " ", html or "")
+            return re.sub(r"\s+", " ", t).strip()
+
+        description = _strip(wp.get("description") or "")
+        short_description = _strip(wp.get("short_description") or "")
 
         variants: List[Dict[str, Any]] = []
         if wp.get("type") == "variable":
-            try:
-                vars_ = _wc_request(
-                    "GET",
-                    f"/wp-json/wc/v3/products/{wc_product_id}/variations?per_page=50",
-                )
-            except HTTPException:
-                vars_ = []
-            for v in vars_ or []:
+            for v in vars_by_parent.get(wc_product_id, []):
                 attrs = v.get("attributes") or []
                 size_label = next(
                     (a.get("option") for a in attrs if "size" in (a.get("name") or "").lower()),
@@ -224,42 +267,65 @@ def _fetch_wc_catalogue() -> List[Dict[str, Any]]:
                 )
                 size_slug = _size_slug_from_label(size_label or "")
                 try:
-                    price = float(v.get("price") or v.get("regular_price") or 0)
+                    price = float(v.get("price") or 0)
                 except (TypeError, ValueError):
                     price = 0.0
-                if price <= 0:
+                try:
+                    regular = float(v.get("regular_price") or 0) or None
+                except (TypeError, ValueError):
+                    regular = None
+                try:
+                    sale = float(v.get("sale_price") or 0) or None
+                except (TypeError, ValueError):
+                    sale = None
+                # selling price = sale if set else price
+                sell = float(sale or price or 0)
+                if sell <= 0:
                     continue
                 variants.append({
                     "size": size_label or ("5ML Tester" if size_slug == "5ml-tester" else "50 ML"),
                     "size_slug": size_slug,
-                    "price": price,
+                    "price": sell,
+                    "regular_price": regular,
+                    "sale_price": sale if sale else sell,
                     "variation_id": v.get("id"),
                     "stock_status": v.get("stock_status"),
                 })
                 variant_map[(product_id, size_slug)] = {
                     "wc_product_id": wc_product_id,
                     "variation_id": v.get("id"),
-                    "price": price,
+                    "price": sell,
                     "name": name_raw,
                     "size": size_label,
                 }
         else:
             try:
-                price = float(wp.get("price") or wp.get("regular_price") or 0)
+                price = float(wp.get("price") or 0)
             except (TypeError, ValueError):
                 price = 0.0
-            if price > 0:
+            try:
+                regular = float(wp.get("regular_price") or 0) or None
+            except (TypeError, ValueError):
+                regular = None
+            try:
+                sale = float(wp.get("sale_price") or 0) or None
+            except (TypeError, ValueError):
+                sale = None
+            sell = float(sale or price or 0)
+            if sell > 0:
                 variants.append({
                     "size": "50 ML",
                     "size_slug": "50-ml",
-                    "price": price,
+                    "price": sell,
+                    "regular_price": regular,
+                    "sale_price": sale if sale else sell,
                     "variation_id": None,
                     "stock_status": wp.get("stock_status"),
                 })
                 variant_map[(product_id, "50-ml")] = {
                     "wc_product_id": wc_product_id,
                     "variation_id": None,
-                    "price": price,
+                    "price": sell,
                     "name": name_raw,
                     "size": "50 ML",
                 }
@@ -272,13 +338,22 @@ def _fetch_wc_catalogue() -> List[Dict[str, Any]]:
             "id": product_id,
             "name": name_raw or product_id,
             "price": preferred["price"],
+            "regular_price": preferred.get("regular_price"),
+            "sale_price": preferred.get("sale_price") or preferred["price"],
             "image": image,
             "wc_id": wc_product_id,
+            "featured": featured or is_signature,
+            "inspired_by": "" if is_signature else inspired,
+            "description": description,
+            "short_description": short_description,
             "variants": variants,
         })
 
+    # Featured / signature first
+    out.sort(key=lambda p: (0 if p.get("featured") else 1, p.get("name") or ""))
     _WC_VARIANT_MAP = variant_map
     return out
+
 
 
 def get_catalogue(force: bool = False) -> List[Dict[str, Any]]:
@@ -328,13 +403,18 @@ def _resolve_variant(product: Dict, size_slug: Optional[str]) -> Dict:
 
 def _compute_order(items: List["CartItem"]) -> Dict:
     catalogue = {p["id"]: p for p in get_catalogue()}
+    # also index aliases
+    for alias, real in _ID_ALIASES.items():
+        if real in catalogue and alias not in catalogue:
+            catalogue[alias] = catalogue[real]
     subtotal = 0.0
     line_items: List[Dict[str, Any]] = []
     stripe_lines: List[Dict[str, Any]] = []
     wc_lines: List[Dict[str, Any]] = []
 
     for item in items:
-        prod = catalogue.get(item.product_id)
+        pid = _ID_ALIASES.get(item.product_id, item.product_id)
+        prod = catalogue.get(pid) or catalogue.get(item.product_id)
         if not prod:
             raise HTTPException(status_code=400, detail=f"Unknown product: {item.product_id}")
         variant = _resolve_variant(prod, item.size_slug)
@@ -618,7 +698,7 @@ class NewsletterRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Kavyn API", version="3.0.0")
+app = FastAPI(title="Kavyn API", version="3.1.0")
 api = APIRouter(prefix="/api")
 
 origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -650,7 +730,7 @@ def health():
 
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "stripe_configured": bool(stripe.api_key),
         "woocommerce_configured": bool(WC_STORE_URL and WC_KEY and WC_SECRET),
         "woocommerce_reachable": wc_ok,
@@ -735,7 +815,9 @@ def create_checkout_session(payload: CheckoutSessionCreateRequest):
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card"],
+            # Enable cards + Apple Pay / Google Pay / Link as configured in Dashboard.
+            # Do NOT set payment_method_types when using automatic_payment_methods.
+            automatic_payment_methods={"enabled": True},
             line_items=order["stripe_lines"],
             success_url=success_url,
             cancel_url=cancel_url,
@@ -931,7 +1013,7 @@ app.include_router(api)
 def root():
     return {
         "service": "kavyn-api",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "health": "/api/health",
         "docs": "/docs",
         "flow": "WooCommerce catalog → Stripe payment (address+phone) → WooCommerce order",
