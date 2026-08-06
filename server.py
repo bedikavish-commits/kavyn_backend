@@ -815,9 +815,12 @@ def create_checkout_session(payload: CheckoutSessionCreateRequest):
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            # Enable cards + Apple Pay / Google Pay / Link as configured in Dashboard.
-            # Do NOT set payment_method_types when using automatic_payment_methods.
-            automatic_payment_methods={"enabled": True},
+            # Checkout Sessions automatically offer every payment method you've
+            # enabled in the Stripe Dashboard (Settings -> Payment methods) —
+            # cards, Apple Pay, Google Pay, Link, etc. Do NOT pass
+            # `automatic_payment_methods` here: that parameter belongs to the
+            # PaymentIntents API, not Checkout Sessions, and Stripe will reject
+            # the request with "Received unknown parameter" if it's included.
             line_items=order["stripe_lines"],
             success_url=success_url,
             cancel_url=cancel_url,
